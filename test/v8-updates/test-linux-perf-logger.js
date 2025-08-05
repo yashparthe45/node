@@ -55,7 +55,7 @@ const testCases = [
   },
   {
     title: '--perf-basic-prof compiled',
-    nodeFlags: ['--perf-basic-prof', '--no-turbo-inlining', '--always-turbofan',
+    nodeFlags: ['--perf-basic-prof', '--no-turbo-inlining',
                 '--minimum-invocations-before-optimization=0'],
     matches: [
       String.raw`RegExp\.> src: 'test-regex' flags: 'gi'`,
@@ -81,7 +81,7 @@ const testCases = [
   },
   {
     title: '--perf-basic-prof-only-functions compiled',
-    nodeFlags: ['--perf-basic-prof-only-functions', '--no-turbo-inlining', '--always-turbofan',
+    nodeFlags: ['--perf-basic-prof-only-functions', '--no-turbo-inlining',
                 '--minimum-invocations-before-optimization=0'],
     matches: [
       'JS:~functionOne .+/linux-perf-logger.js',
