@@ -255,9 +255,6 @@ class V8_EXPORT Context : public Data {
    */
   Maybe<void> DeepFreeze(DeepFreezeDelegate* delegate = nullptr);
 
-  /** Returns the isolate associated with a current context. */
-  Isolate* GetIsolate();
-
   /** Returns the microtask queue associated with a current context. */
   MicrotaskQueue* GetMicrotaskQueue();
 
@@ -306,12 +303,20 @@ class V8_EXPORT Context : public Data {
                                                     int index);
   V8_INLINE void* GetAlignedPointerFromEmbedderData(int index);
 
+  void SetAlignedPointerInEmbedderData(int index, void* value,
+                                       EmbedderDataTypeTag tag);
+
   /**
    * Sets a 2-byte-aligned native pointer in the embedder data with the given
    * index, growing the data as needed. Note that index 0 currently has a
    * special meaning for Chrome's debugger.
    */
-  void SetAlignedPointerInEmbedderData(int index, void* value);
+  V8_DEPRECATE_SOON(
+      "Use SetAlignedPointerInEmbedderData with EmbedderDataTypeTag parameter "
+      "instead.")
+  void SetAlignedPointerInEmbedderData(int index, void* value) {
+    SetAlignedPointerInEmbedderData(index, value, kEmbedderDataTypeTagDefault);
+  }
 
   /**
    * Control whether code generation from strings is allowed. Calling
@@ -451,8 +456,7 @@ Local<Value> Context::GetEmbedderData(int index) {
   value = I::DecompressTaggedField(embedder_data, static_cast<uint32_t>(value));
 #endif
 
-  auto isolate = reinterpret_cast<v8::Isolate*>(
-      internal::IsolateFromNeverReadOnlySpaceObject(ctx));
+  auto* isolate = I::GetCurrentIsolate();
   return Local<Value>::New(isolate, value);
 #else
   return SlowGetEmbedderData(index);
@@ -470,7 +474,8 @@ void* Context::GetAlignedPointerFromEmbedderData(Isolate* isolate, int index) {
                      (I::kEmbedderDataSlotSize * index) +
                      I::kEmbedderDataSlotExternalPointerOffset;
   return reinterpret_cast<void*>(
-      I::ReadExternalPointerField<internal::kEmbedderDataSlotPayloadTag>(
+      I::ReadExternalPointerField<{internal::kFirstEmbedderDataTag,
+                                   internal::kLastEmbedderDataTag}>(
           isolate, embedder_data, value_offset));
 #else
   return SlowGetAlignedPointerFromEmbedderData(index);
@@ -487,9 +492,10 @@ void* Context::GetAlignedPointerFromEmbedderData(int index) {
   int value_offset = I::kEmbedderDataArrayHeaderSize +
                      (I::kEmbedderDataSlotSize * index) +
                      I::kEmbedderDataSlotExternalPointerOffset;
-  Isolate* isolate = I::GetIsolateForSandbox(ctx);
+  Isolate* isolate = I::GetCurrentIsolateForSandbox();
   return reinterpret_cast<void*>(
-      I::ReadExternalPointerField<internal::kEmbedderDataSlotPayloadTag>(
+      I::ReadExternalPointerField<{internal::kFirstEmbedderDataTag,
+                                   internal::kLastEmbedderDataTag}>(
           isolate, embedder_data, value_offset));
 #else
   return SlowGetAlignedPointerFromEmbedderData(index);

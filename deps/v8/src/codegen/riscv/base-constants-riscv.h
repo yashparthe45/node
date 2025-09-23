@@ -66,7 +66,7 @@ constexpr int kRootRegisterBias = 256;
   V(m2)             \
   V(m4)             \
   V(m8)             \
-  V(RESERVERD)      \
+  V(RESERVED)       \
   V(mf8)            \
   V(mf4)            \
   V(mf2)
@@ -93,8 +93,8 @@ enum VSew {
 
 // RISC-V can perform PC-relative jumps within a 32-bit range using the
 // following two instructions:
-//   auipc   t6, imm20    ; t0 = PC + imm20 * 2^12
-//   jalr    ra, t6, imm12; ra = PC + 4, PC = t0 + imm12,
+//   auipc   t6, imm20    ; t6 = PC + imm20 * 2^12
+//   jalr    ra, t6, imm12; ra = PC + 4, PC = t6 + imm12,
 // Both imm20 and imm12 are treated as two's-complement signed values, usually
 // calculated as:
 //   imm20 = (offset + 0x800) >> 12
@@ -341,7 +341,6 @@ static_assert(
 #else
 constexpr int kRvvVLEN = 128;
 #endif
-constexpr int kRvvSLEN = kRvvVLEN;
 
 const int kRvvFunct6Shift = 26;
 const int kRvvFunct6Bits = 6;
@@ -432,6 +431,7 @@ const uint32_t kImm12Mask = ((1 << kImm12Bits) - 1) << kImm12Shift;
 const uint32_t kImm11Mask = ((1 << kImm11Bits) - 1) << kImm11Shift;
 const uint32_t kImm31_12Mask = ((1 << 20) - 1) << 12;
 const uint32_t kImm19_0Mask = ((1 << 20) - 1);
+const uint32_t kMopMask = kITypeMask | 0b1 << 31 | 0b11 << 28 | 0b1 << 25;
 
 const int kNopByte = 0x00000013;
 // Original MIPS constants
@@ -1183,6 +1183,8 @@ class InstructionGetters : public T {
 
   uint32_t Rvvuimm() const;
 
+  uint32_t MopNumber();
+
   inline uint32_t RvvVsew() const {
     uint32_t zimm = this->Rvvzimm();
     uint32_t vsew = (zimm >> 3) & 0x7;
@@ -1228,8 +1230,8 @@ class InstructionGetters : public T {
     }
   }
 
-#define sext(x, len) (((int32_t)(x) << (32 - len)) >> (32 - len))
-#define zext(x, len) (((uint32_t)(x) << (32 - len)) >> (32 - len))
+#define sext(x, len) ((static_cast<int32_t>(x) << (32 - len)) >> (32 - len))
+#define zext(x, len) ((static_cast<uint32_t>(x) << (32 - len)) >> (32 - len))
 
   inline int32_t RvvSimm5() const {
     DCHECK(this->InstructionType() == InstructionBase::kVType);

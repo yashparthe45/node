@@ -23,17 +23,19 @@ struct BuiltinCallDescriptor {
   struct Descriptor {
     static const TSCallDescriptor* Create(
         StubCallMode call_mode, Zone* zone,
-        LazyDeoptOnThrow lazy_deopt_on_throw = LazyDeoptOnThrow::kNo) {
+        LazyDeoptOnThrow lazy_deopt_on_throw = LazyDeoptOnThrow::kNo,
+        bool compiling_builtins = false) {
       CallInterfaceDescriptor interface_descriptor =
           Builtins::CallInterfaceDescriptorFor(Derived::kFunction);
       auto descriptor = Linkage::GetStubCallDescriptor(
           zone, interface_descriptor,
           interface_descriptor.GetStackParameterCount(),
-          Derived::kNeedsFrameState ? CallDescriptor::kNeedsFrameState
-                                    : CallDescriptor::kNoFlags,
+          (Derived::kNeedsFrameState && !compiling_builtins)
+              ? CallDescriptor::kNeedsFrameState
+              : CallDescriptor::kNoFlags,
           Derived::kProperties, call_mode);
 #ifdef DEBUG
-      Derived::Verify(descriptor);
+      Derived::Verify(descriptor, compiling_builtins);
 #endif  // DEBUG
       bool can_throw = !(Derived::kProperties & Operator::kNoThrow);
       return TSCallDescriptor::Create(
@@ -42,7 +44,7 @@ struct BuiltinCallDescriptor {
     }
 
 #ifdef DEBUG
-    static void Verify(const CallDescriptor* desc) {
+    static void Verify(const CallDescriptor* desc, bool compiling_builtins) {
       using results_t = typename Derived::results_t;
       using arguments_t = typename Derived::arguments_t;
       DCHECK_EQ(desc->ReturnCount(), std::tuple_size_v<results_t>);
@@ -58,7 +60,8 @@ struct BuiltinCallDescriptor {
             RegisterRepresentation::FromMachineRepresentation(
                 desc->GetReturnType(1).representation())));
       }
-      DCHECK_EQ(desc->NeedsFrameState(), Derived::kNeedsFrameState);
+      DCHECK_EQ(desc->NeedsFrameState(),
+                (Derived::kNeedsFrameState && !compiling_builtins));
       DCHECK_EQ(desc->properties(), Derived::kProperties);
       DCHECK_EQ(desc->ParameterCount(), std::tuple_size_v<arguments_t> +
                                             (Derived::kNeedsContext ? 1 : 0));
@@ -101,6 +104,17 @@ struct BuiltinCallDescriptor {
   using Never = std::tuple<OpIndex>;
 
  public:
+  struct BigIntAdd : public Descriptor<BigIntAdd> {
+    static constexpr auto kFunction = Builtin::kBigIntAdd;
+    using arguments_t = std::tuple<V<Numeric>, V<Numeric>>;
+    using results_t = std::tuple<V<BigInt>>;
+
+    static constexpr bool kNeedsFrameState = false;
+    static constexpr bool kNeedsContext = true;
+    static constexpr Operator::Properties kProperties = Operator::kNoProperties;
+    static constexpr OpEffects kEffects = base_effects.CanCallAnything();
+  };
+
   struct CheckTurbofanType : public Descriptor<CheckTurbofanType> {
     static constexpr auto kFunction = Builtin::kCheckTurbofanType;
     using arguments_t = std::tuple<V<Object>, V<TurbofanType>, V<Smi>>;
@@ -143,6 +157,18 @@ struct BuiltinCallDescriptor {
   };
   GENERIC_UNOP_LIST(DECL_GENERIC_UNOP)
 #undef DECL_GENERIC_UNOP
+
+  struct DetachContextCell : public Descriptor<DetachContextCell> {
+    static constexpr auto kFunction = Builtin::kDetachContextCell;
+    using arguments_t = std::tuple<V<Context>, V<Object>, V<WordPtr>>;
+    using results_t = std::tuple<V<Object>>;
+
+    static constexpr bool kNeedsFrameState = true;
+    static constexpr bool kNeedsContext = false;
+    static constexpr Operator::Properties kProperties = Operator::kNoProperties;
+    static constexpr OpEffects kEffects =
+        base_effects.CanWriteHeapMemory().CanReadMemory();
+  };
 
   struct ToNumber : public Descriptor<ToNumber> {
     static constexpr auto kFunction = Builtin::kToNumber;
@@ -204,17 +230,23 @@ struct BuiltinCallDescriptor {
   template <Builtin B, typename Input>
   struct DebugPrint : public Descriptor<DebugPrint<B, Input>> {
     static constexpr auto kFunction = B;
-    using arguments_t = std::tuple<V<Input>>;
+    using StringOrSmi = Union<String, Smi>;
+    // We use smi:0 for an empty label.
+    using arguments_t = std::tuple<V<StringOrSmi>, V<Input>>;
     using results_t = std::tuple<V<Object>>;
 
     static constexpr bool kNeedsFrameState = false;
     static constexpr bool kNeedsContext = true;
     static constexpr Operator::Properties kProperties =
         Operator::kNoThrow | Operator::kNoDeopt;
-    static constexpr OpEffects kEffects = base_effects.RequiredWhenUnused();
+    static constexpr OpEffects kEffects =
+        base_effects.RequiredWhenUnused().CanAllocate();
   };
+  using DebugPrintObject = DebugPrint<Builtin::kDebugPrintObject, Object>;
+  using DebugPrintWord32 = DebugPrint<Builtin::kDebugPrintWord32, Word32>;
+  using DebugPrintWord64 = DebugPrint<Builtin::kDebugPrintWord64, Word64>;
+  using DebugPrintFloat32 = DebugPrint<Builtin::kDebugPrintFloat32, Float32>;
   using DebugPrintFloat64 = DebugPrint<Builtin::kDebugPrintFloat64, Float64>;
-  using DebugPrintWordPtr = DebugPrint<Builtin::kDebugPrintWordPtr, WordPtr>;
 
   template <Builtin B>
   struct FindOrderedHashEntry : public Descriptor<FindOrderedHashEntry<B>> {
@@ -675,6 +707,19 @@ struct BuiltinCallDescriptor {
         base_effects.CanAllocateWithoutIdentity();
   };
 
+  struct WasmInt32ToSharedHeapNumber
+      : public Descriptor<WasmInt32ToSharedHeapNumber> {
+    static constexpr auto kFunction = Builtin::kWasmInt32ToSharedHeapNumber;
+    using arguments_t = std::tuple<V<Word32>>;
+    using results_t = std::tuple<V<HeapNumber>>;
+
+    static constexpr bool kNeedsFrameState = false;
+    static constexpr bool kNeedsContext = false;
+    static constexpr Operator::Properties kProperties = Operator::kPure;
+    static constexpr OpEffects kEffects =
+        base_effects.CanAllocateWithoutIdentity();
+  };
+
   struct WasmRefFunc : public Descriptor<WasmRefFunc> {
     static constexpr auto kFunction = Builtin::kWasmRefFunc;
     using arguments_t = std::tuple<V<Word32>, V<Word32>>;
@@ -741,7 +786,7 @@ struct BuiltinCallDescriptor {
     static constexpr bool kNeedsContext = false;
     static constexpr Operator::Properties kProperties = Operator::kNoProperties;
     static constexpr OpEffects kEffects =
-        base_effects.CanReadMemory().CanWriteMemory();
+        base_effects.CanReadMemory().CanWriteMemory().CanAllocate();
   };
 
   struct WasmStringFromCodePoint : public Descriptor<WasmStringFromCodePoint> {
@@ -1384,6 +1429,17 @@ struct BuiltinCallDescriptor {
     static constexpr auto kFunction = Builtin::kWasmPropagateException;
     using arguments_t = std::tuple<>;
     using results_t = Never;
+
+    static constexpr bool kNeedsFrameState = false;
+    static constexpr bool kNeedsContext = false;
+    static constexpr Operator::Properties kProperties = Operator::kNoProperties;
+    static constexpr OpEffects kEffects = base_effects.CanCallAnything();
+  };
+
+  struct WasmFXResume : public Descriptor<WasmFXResume> {
+    static constexpr auto kFunction = Builtin::kWasmFXResume;
+    using arguments_t = std::tuple<V<WordPtr>>;  // StackMemory to be resumed.
+    using results_t = std::tuple<>;
 
     static constexpr bool kNeedsFrameState = false;
     static constexpr bool kNeedsContext = false;

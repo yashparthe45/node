@@ -8,6 +8,7 @@
 #include "src/base/bounds.h"
 #include "src/base/flags.h"
 #include "src/flags/flags.h"
+#include "src/utils/utils.h"  // For BytecodeOffset.
 
 namespace v8 {
 namespace internal {
@@ -28,7 +29,8 @@ namespace internal {
   V(INTERPRETED_FUNCTION)  \
   V(BASELINE)              \
   V(MAGLEV)                \
-  V(TURBOFAN_JS)
+  V(TURBOFAN_JS)           \
+  V(WASM_STACK_ENTRY)
 
 enum class CodeKind : uint8_t {
 #define DEFINE_CODE_KIND_ENUM(name) name,
@@ -46,7 +48,9 @@ static_assert(kCodeKindCount <= std::numeric_limits<uint8_t>::max());
 
 const char* CodeKindToString(CodeKind kind);
 
-const char* CodeKindToMarker(CodeKind kind, bool context_specialized);
+// The marker is used to distinguish code variants for profiling.
+const char* CodeKindToMarker(CodeKind kind, bool context_specialized,
+                             BytecodeOffset osr_offset);
 
 inline constexpr bool CodeKindIsInterpretedJSFunction(CodeKind kind) {
   return kind == CodeKind::INTERPRETED_FUNCTION;

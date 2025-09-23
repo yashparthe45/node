@@ -8,10 +8,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "include/v8-internal.h"
 #include "src/base/platform/mutex.h"
 #include "src/common/globals.h"
 #include "src/utils/allocation.h"
-#include "v8-internal.h"
 
 namespace v8 {
 namespace internal {
@@ -136,6 +136,9 @@ class CodeRange final : public VirtualMemoryCage {
   // When sharing a CodeRange among Isolates, calls to RemapEmbeddedBuiltins may
   // race during Isolate::Init.
   base::Mutex remap_embedded_builtins_mutex_;
+
+  // Red zones that we should not allocate in.
+  std::vector<base::AddressRegion> red_zones_;
 
 #if !defined(V8_OS_WIN) && !defined(V8_OS_IOS) && defined(DEBUG)
   bool immutable_ = false;

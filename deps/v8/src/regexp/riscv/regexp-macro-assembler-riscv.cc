@@ -111,8 +111,16 @@ RegExpMacroAssemblerRISCV::RegExpMacroAssemblerRISCV(Isolate* isolate,
   __ bind(&start_label_);  // And then continue from here.
 }
 
-RegExpMacroAssemblerRISCV::~RegExpMacroAssemblerRISCV() {
-  // Unuse labels in case we throw away the assembler without calling GetCode.
+RegExpMacroAssemblerRISCV::~RegExpMacroAssemblerRISCV() = default;
+
+void RegExpMacroAssemblerRISCV::AbortedCodeGeneration() {
+  // Tell the underlying assembler that we're aborting the code generation, so
+  // it can clean up and clear constant pools.
+  masm_->AbortedCodeGeneration();
+
+  // We are throwing away the assembler without calling GetCode, so we unuse
+  // all the labels to avoid running into issues when destructing linked, but
+  // not bound, labels.
   entry_label_.Unuse();
   start_label_.Unuse();
   success_label_.Unuse();
@@ -202,7 +210,7 @@ void RegExpMacroAssemblerRISCV::CheckCharacterLT(base::uc16 limit,
   BranchOrBacktrack(on_less, lt, current_character(), Operand(limit));
 }
 
-void RegExpMacroAssemblerRISCV::CheckGreedyLoop(Label* on_equal) {
+void RegExpMacroAssemblerRISCV::CheckFixedLengthLoop(Label* on_equal) {
   Label backtrack_non_equal;
   __ Lw(a0, MemOperand(backtrack_stackpointer(), 0));
   __ BranchShort(&backtrack_non_equal, ne, current_input_offset(), Operand(a0));
@@ -499,16 +507,135 @@ void RegExpMacroAssemblerRISCV::CheckBitInTable(Handle<ByteArray> table,
 }
 
 void RegExpMacroAssemblerRISCV::SkipUntilBitInTable(
-    int cp_offset, Handle<ByteArray> table, Handle<ByteArray> nibble_table,
-    int advance_by) {
-  // TODO(pthier): Optimize. Table can be loaded outside of the loop.
-  Label cont, again;
-  Bind(&again);
-  LoadCurrentCharacter(cp_offset, &cont, true);
-  CheckBitInTable(table, &cont);
+    int cp_offset, Handle<ByteArray> table,
+    Handle<ByteArray> nibble_table_array, int advance_by, Label* on_match,
+    Label* on_no_match) {
+  const bool use_simd = SkipUntilBitInTableUseSimd(advance_by);
+  if (use_simd) {
+    DCHECK(!nibble_table_array.is_null());
+    Label simd_repeat, found, scalar;
+    static constexpr int kVectorSize = 16;
+    const int kCharsPerVector = kVectorSize / char_size();
+
+    // Fallback to scalar version if there are less than kCharsPerVector chars
+    // left in the subject.
+    // We subtract 1 because CheckPosition assumes we are reading 1 character
+    // plus cp_offset. So the -1 is the the character that is assumed to be
+    // read by default.
+    CheckPosition(cp_offset + kCharsPerVector - 1, &scalar);
+
+    __ VU.SetSimd128(E8);
+
+    // Load table and mask constants.
+    // For a description of the table layout, check the comment on
+    // BoyerMooreLookahead::GetSkipTable in regexp-compiler.cc.
+    VRegister nibble_table = v1;
+    __ li(t0, Operand(nibble_table_array));
+    __ addi(t0, t0, OFFSET_OF_DATA_START(ByteArray) - kHeapObjectTag);
+    __ vl(nibble_table, t0, 0, E8);
+    VRegister hi_nibble_lookup_mask = v2;
+    const uint8_t imms[16] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+                              0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+    __ WasmRvvS128const(hi_nibble_lookup_mask, imms);
+    // WasmRvvS128const may update the vector length setting.
+    __ VU.SetSimd128(E8);
+
+    Bind(&simd_repeat);
+    // Load next characters into vector.
+    VRegister input_vec = v3;
+    __ AddWord(kScratchReg2, end_of_input_address(),
+               Operand(current_input_offset()));
+    int offset = cp_offset * char_size();
+    if (offset != 0) {
+      __ AddWord(kScratchReg2, kScratchReg2, Operand(offset));
+    }
+    __ vl(input_vec, kScratchReg2, 0, E8);
+
+    // Extract low nibbles.
+    // lo_nibbles = input & 0x0f.
+    VRegister lo_nibbles = v4;
+    __ vand_vi(lo_nibbles, input_vec, 0x0f);
+
+    // Extract high nibbles.
+    // hi_nibbles = (input >> 4) & 0x0f
+    VRegister hi_nibbles = v5;
+    __ vsrl_vi(hi_nibbles, input_vec, 4);
+
+    // Get rows of nibbles table based on low nibbles.
+    // row = nibble_table[lo_nibbles]
+    VRegister row = v6;
+    __ vrgather_vv(row, nibble_table, lo_nibbles);
+
+    // Check if high nibble is set in row.
+    // bitmask = 1 << (hi_nibbles & 0x7)
+    //         = hi_nibbles_lookup_mask[hi_nibbles] & 0x7
+    // Note: The hi_nibbles & 0x7 part is implicitly executed, as tbl sets
+    // the result byte to zero if the lookup index is out of range.
+    VRegister bitmask = v7;
+    __ vrgather_vv(bitmask, hi_nibble_lookup_mask, hi_nibbles);
+
+    // result = row & bitmask != 0
+    VRegister result = v8;
+    __ vand_vv(result, row, bitmask);
+    // Set the mask v0, if the result is not zero.
+    __ vmsne_vi(v0, result, 0);
+    // 'vfirst_m' returns -1 if no bit is set. The lowest element with a 1
+    // value otherwise.
+    __ vfirst_m(t0, v0);
+
+    __ Branch(&found, ge, t0, Operand(zero_reg));
+
+    // The maximum lookahead for boyer moore is less than vector size, so we can
+    // ignore advance_by in the vectorized version.
+    AdvanceCurrentPosition(kCharsPerVector);
+    CheckPosition(cp_offset + kCharsPerVector - 1, &scalar);
+    __ Branch(&simd_repeat);
+
+    Bind(&found);
+    if (mode_ == UC16) {
+      // Make sure that we skip an even number of bytes in 2-byte subjects.
+      // Odd skips can happen if the higher byte produced a match.
+      // False positives should be rare and are no problem in general, as the
+      // following instructions will check for an exact match.
+      __ And(t0, t0, Operand(0xfffe));
+    }
+    __ AddWord(current_input_offset(), current_input_offset(), t0);
+    __ Branch(on_match);
+    Bind(&scalar);
+  }
+
+  // Scalar version.
+  Register table_reg = a0;
+  __ li(table_reg, Operand(table));
+
+  Label scalar_repeat;
+  Bind(&scalar_repeat);
+  CheckPosition(cp_offset, on_no_match);
+  LoadCurrentCharacterUnchecked(cp_offset, 1);
+
+  // We use `a1` as a temporary for the table lookup.
+  DCHECK_NE(a1, table_reg);
+
+  // This is the `CheckBitInTable` code, but with the table already loaded
+  // in the `table_reg` register.
+  if (mode_ != LATIN1 || kTableMask != String::kMaxOneByteCharCode) {
+    __ And(a1, current_character(), Operand(kTableMask));
+    __ AddWord(a1, table_reg, a1);
+  } else {
+    __ AddWord(a1, table_reg, current_character());
+  }
+  __ Lbu(a1, FieldMemOperand(a1, OFFSET_OF_DATA_START(ByteArray)));
+  BranchOrBacktrack(on_match, ne, a1, Operand(zero_reg));
+
   AdvanceCurrentPosition(advance_by);
-  GoTo(&again);
-  Bind(&cont);
+  __ jmp(&scalar_repeat);
+}
+
+bool RegExpMacroAssemblerRISCV::SkipUntilBitInTableUseSimd(int advance_by) {
+  // We only use SIMD instead of the scalar version if we advance by 1 byte
+  // in each iteration. For higher values the scalar version performs better.
+  return v8_flags.regexp_simd && advance_by * char_size() == 1 &&
+         CpuFeatures::IsSupported(RISCV_SIMD);
 }
 
 bool RegExpMacroAssemblerRISCV::CheckSpecialClassRanges(
@@ -1009,6 +1136,9 @@ DirectHandle<HeapObject> RegExpMacroAssemblerRISCV::GetCode(
           .set_self_reference(masm_->CodeObject())
           .set_empty_source_position_table()
           .Build();
+  if (v8_flags.print_code) {
+    Print(*code);
+  }
   LOG(masm_->isolate(),
       RegExpCodeCreateEvent(Cast<AbstractCode>(code), source, flags));
   return Cast<HeapObject>(code);
@@ -1060,20 +1190,8 @@ void RegExpMacroAssemblerRISCV::PushBacktrack(Label* label) {
     __ li(a0,
           Operand(target + InstructionStream::kHeaderSize - kHeapObjectTag));
   } else {
-    Assembler::BlockTrampolinePoolScope block_trampoline_pool(masm_.get());
-    Label after_constant;
-    __ BranchShort(&after_constant);
-    int offset = masm_->pc_offset();
-    int cp_offset = offset + InstructionStream::kHeaderSize - kHeapObjectTag;
-    __ emit(0);
-    masm_->label_at_put(label, offset);
-    __ bind(&after_constant);
-    if (is_int16(cp_offset)) {
-      __ Load32U(a0, MemOperand(code_pointer(), cp_offset));
-    } else {
-      __ AddWord(a0, code_pointer(), cp_offset);
-      __ Load32U(a0, MemOperand(a0, 0));
-    }
+    __ LoadAddress(a0, label);
+    __ SubWord(a0, a0, code_pointer());
   }
   Push(a0);
   CheckStackLimit();
@@ -1088,7 +1206,7 @@ void RegExpMacroAssemblerRISCV::PushRegister(int register_index,
                                              StackCheckFlag check_stack_limit) {
   __ LoadWord(a0, register_location(register_index));
   Push(a0);
-  if (check_stack_limit) {
+  if (check_stack_limit == StackCheckFlag::kCheckStackLimit) {
     CheckStackLimit();
   } else if (V8_UNLIKELY(v8_flags.slow_debug_code)) {
     AssertAboveStackLimitMinusSlack();
@@ -1157,9 +1275,7 @@ void RegExpMacroAssemblerRISCV::ClearRegisters(int reg_from, int reg_to) {
     __ StoreWord(a0, register_location(reg));
   }
 }
-#ifdef RISCV_HAS_NO_UNALIGNED
-bool RegExpMacroAssemblerRISCV::CanReadUnaligned() const { return false; }
-#endif
+
 // Private methods:
 
 void RegExpMacroAssemblerRISCV::CallCheckStackGuardState(Register scratch,
@@ -1240,7 +1356,7 @@ int64_t RegExpMacroAssemblerRISCV::CheckStackGuardState(Address* return_address,
                                                         Address re_frame,
                                                         uintptr_t extra_space) {
   Tagged<InstructionStream> re_code =
-      Cast<InstructionStream>(Tagged<Object>(raw_code));
+      SbxCast<InstructionStream>(Tagged<Object>(raw_code));
   return NativeRegExpMacroAssembler::CheckStackGuardState(
       frame_entry<Isolate*>(re_frame, kIsolateOffset),
       static_cast<int>(frame_entry<int64_t>(re_frame, kStartIndexOffset)),

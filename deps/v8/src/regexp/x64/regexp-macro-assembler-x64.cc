@@ -214,7 +214,7 @@ void RegExpMacroAssemblerX64::CheckCharacterLT(base::uc16 limit,
   BranchOrBacktrack(less, on_less);
 }
 
-void RegExpMacroAssemblerX64::CheckGreedyLoop(Label* on_equal) {
+void RegExpMacroAssemblerX64::CheckFixedLengthLoop(Label* on_equal) {
   Label fallthrough;
   __ cmpl(rdi, Operand(backtrack_stackpointer(), 0));
   __ j(not_equal, &fallthrough);
@@ -601,8 +601,9 @@ void RegExpMacroAssemblerX64::CheckBitInTable(
 
 void RegExpMacroAssemblerX64::SkipUntilBitInTable(
     int cp_offset, Handle<ByteArray> table,
-    Handle<ByteArray> nibble_table_array, int advance_by) {
-  Label cont, scalar_repeat;
+    Handle<ByteArray> nibble_table_array, int advance_by, Label* on_match,
+    Label* on_no_match) {
+  Label scalar_repeat;
 
   const bool use_simd = SkipUntilBitInTableUseSimd(advance_by);
   if (use_simd) {
@@ -694,7 +695,7 @@ void RegExpMacroAssemblerX64::SkipUntilBitInTable(
       __ andl(r11, Immediate(0xfffe));
     }
     __ addq(rdi, r11);
-    __ jmp(&cont);
+    __ jmp(on_match);
     Bind(&scalar);
   }
 
@@ -703,7 +704,7 @@ void RegExpMacroAssemblerX64::SkipUntilBitInTable(
   __ Move(table_reg, table);
 
   Bind(&scalar_repeat);
-  CheckPosition(cp_offset, &cont);
+  CheckPosition(cp_offset, on_no_match);
   LoadCurrentCharacterUnchecked(cp_offset, 1);
   Register index = current_character();
   if (mode_ != LATIN1 || kTableMask != String::kMaxOneByteCharCode) {
@@ -714,11 +715,9 @@ void RegExpMacroAssemblerX64::SkipUntilBitInTable(
   __ cmpb(
       FieldOperand(table_reg, index, times_1, OFFSET_OF_DATA_START(ByteArray)),
       Immediate(0));
-  __ j(not_equal, &cont);
+  __ j(not_equal, on_match);
   AdvanceCurrentPosition(advance_by);
   __ jmp(&scalar_repeat);
-
-  __ bind(&cont);
 }
 
 bool RegExpMacroAssemblerX64::SkipUntilBitInTableUseSimd(int advance_by) {
@@ -908,6 +907,10 @@ DirectHandle<HeapObject> RegExpMacroAssemblerX64::GetCode(
   // Tell the system that we have a stack frame. Because the type is MANUAL, no
   // physical frame is generated.
   FrameScope scope(&masm_, StackFrame::MANUAL);
+
+#ifdef V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
+  __ AssertInSandboxedExecutionMode();
+#endif  // V8_ENABLE_SANDBOX_HARDWARE_SUPPORT
 
   // Actually emit code to start a new stack frame. This pushes the frame type
   // marker into the stack slot at kFrameTypeOffset.
@@ -1333,7 +1336,7 @@ void RegExpMacroAssemblerX64::PushRegister(int register_index,
                                            StackCheckFlag check_stack_limit) {
   __ movq(rax, register_location(register_index));
   Push(rax);
-  if (check_stack_limit) {
+  if (check_stack_limit == StackCheckFlag::kCheckStackLimit) {
     CheckStackLimit();
   } else if (V8_UNLIKELY(v8_flags.slow_debug_code)) {
     AssertAboveStackLimitMinusSlack();
@@ -1463,7 +1466,7 @@ int RegExpMacroAssemblerX64::CheckStackGuardState(Address* return_address,
                                                   Address re_frame,
                                                   uintptr_t extra_space) {
   Tagged<InstructionStream> re_code =
-      Cast<InstructionStream>(Tagged<Object>(raw_code));
+      SbxCast<InstructionStream>(Tagged<Object>(raw_code));
   return NativeRegExpMacroAssembler::CheckStackGuardState(
       frame_entry<Isolate*>(re_frame, kIsolateOffset),
       frame_entry<int>(re_frame, kStartIndexOffset),
